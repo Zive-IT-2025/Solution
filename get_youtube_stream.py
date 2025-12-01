@@ -3,8 +3,11 @@ Get direct stream URL from YouTube video/livestream
 """
 import yt_dlp
 import sys
+import logging
 
-def get_youtube_stream_url(youtube_url):
+logger = logging.getLogger(__name__)
+
+def get_youtube_stream_url(youtube_url, verbose=False):
     """
     Extract direct stream URL from YouTube video/livestream
     
@@ -37,17 +40,22 @@ def get_youtube_stream_url(youtube_url):
             else:
                 return None
             
-            print(f"✅ Stream URL extracted successfully!")
-            print(f"📺 Title: {info.get('title', 'Unknown')}")
-            print(f"🔗 Direct URL: {stream_url}")
-            print(f"\n💡 Use in config.yaml:")
-            print(f'   camera:')
-            print(f'     source: "{stream_url}"')
+            if verbose:
+                print(f"✅ Stream URL extracted successfully!")
+                print(f"📺 Title: {info.get('title', 'Unknown')}")
+                print(f"🔗 Direct URL: {stream_url}")
+                print(f"\n💡 Use in config.yaml:")
+                print(f'   camera:')
+                print(f'     source: "{stream_url}"')
+            else:
+                logger.info(f"Extracted stream URL from: {info.get('title', 'Unknown')}")
             
             return stream_url
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        if verbose:
+            print(f"❌ Error: {e}")
+        logger.error(f"Error extracting YouTube stream: {e}")
         return None
 
 if __name__ == '__main__':
@@ -57,4 +65,4 @@ if __name__ == '__main__':
         sys.exit(1)
     
     youtube_url = sys.argv[1]
-    get_youtube_stream_url(youtube_url)
+    get_youtube_stream_url(youtube_url, verbose=True)

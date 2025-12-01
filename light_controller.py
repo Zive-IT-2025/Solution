@@ -1,10 +1,11 @@
 """
 Light Controller Module
-Supports multiple lighting control backends: simulated, MQTT, HTTP, Philips Hue
+Supports multiple lighting control backends: simulated, MQTT, HTTP, Philips Hue, OpenLab
 """
 
 import time
 import logging
+import json
 from typing import Optional, Dict
 from abc import ABC, abstractmethod
 import requests
@@ -397,6 +398,151 @@ class PhilipsHueLightController(LightController):
         }
 
 
+class OpenLabLightController(LightController):
+    """OpenLab MQTT-based light controller for TUKE school lights"""
+    
+    def __init__(self, config: dict):
+        super().__init__(config)
+        
+        if not MQTT_AVAILABLE:
+            raise ImportError("paho-mqtt not installed")
+        
+        # OpenLab specific configuration
+        openlab_config = config.get('openlab', {})
+        self.broker = openlab_config.get('broker', 'openlab.kpi.fei.tuke.sk')
+        self.port = openlab_config.get('port', 1883)
+        self.topic = '/openlab/lights'  # Fixed topic for OpenLab (with leading slash)
+        self.fade_duration_ms = int(config.get('fade_duration', 1.0) * 1000)  # Convert to ms
+        
+        # Light selection
+        self.control_all = openlab_config.get('control_all', True)
+        self.light_ids = openlab_config.get('light_ids', list(range(1, 98)))  # All 97 lights by default
+        
+        # Create MQTT client
+        self.client = mqtt.Client()
+        self.connected = False
+        
+        # Set up callbacks
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        
+        try:
+            logger.info(f"Connecting to OpenLab MQTT broker: {self.broker}:{self.port}")
+            self.client.connect(self.broker, self.port, 60)
+            self.client.loop_start()
+            logger.info("OpenLab Light Controller initialized")
+        except Exception as e:
+            logger.error(f"Failed to connect to OpenLab MQTT broker: {e}")
+            raise
+    
+    def _on_connect(self, client, userdata, flags, rc):
+        """Callback when connected to MQTT broker"""
+        if rc == 0:
+            self.connected = True
+            logger.info("Connected to OpenLab MQTT broker")
+        else:
+            logger.error(f"Failed to connect to OpenLab MQTT, return code: {rc}")
+            self.connected = False
+    
+    def _on_disconnect(self, client, userdata, rc):
+        """Callback when disconnected from MQTT broker"""
+        self.connected = False
+        logger.info("Disconnected from OpenLab MQTT broker")
+    
+    def _brightness_to_rgbw(self, brightness: int) -> str:
+        """
+        Convert brightness (0-100) to RGBW hex string
+        
+        Args:
+            brightness: Brightness percentage (0-100)
+        
+        Returns:
+            RGBW hex string (e.g., "0000ff00" for white at max)
+        """
+        # Map brightness 0-100 to 0-255
+        white_value = int((brightness / 100.0) * 255)
+        
+        # Format as RGBW: RGB=000000 (off), W=brightness
+        # Using pure white light (W channel only)
+        rgbw = f"000000{white_value:02x}"
+        
+        return rgbw
+    
+    def set_brightness(self, brightness: int):
+        """Set brightness of OpenLab lights via MQTT"""
+        brightness = max(0, min(100, brightness))
+        
+        if not self.connected:
+            logger.warning("Not connected to OpenLab MQTT broker")
+            return
+        
+        try:
+            # Convert brightness to RGBW format
+            rgbw_value = self._brightness_to_rgbw(brightness)
+            
+            # Create MQTT payload
+            if self.control_all:
+                # Control all lights at once
+                payload = {
+                    "all": rgbw_value,
+                    "duration": self.fade_duration_ms
+                }
+            else:
+                # Control specific lights
+                light_dict = {}
+                for light_id in self.light_ids:
+                    light_dict[str(light_id)] = rgbw_value
+                
+                payload = {
+                    "light": light_dict,
+                    "duration": self.fade_duration_ms
+                }
+            
+            # Publish to OpenLab
+            json_payload = json.dumps(payload)
+            logger.info(f"Publishing to {self.topic}: {json_payload}")
+            result = self.client.publish(self.topic, json_payload, qos=0)
+            
+            if result.rc == 0:
+                self.current_brightness = brightness
+                self.last_update = time.time()
+                logger.info(f"✓ OpenLab lights set to {brightness}% (RGBW: {rgbw_value}, duration: {self.fade_duration_ms}ms) - Message sent successfully")
+            else:
+                logger.error(f"✗ Failed to publish to OpenLab MQTT, return code: {result.rc}")
+        
+        except Exception as e:
+            logger.error(f"Error controlling OpenLab lights: {e}")
+    
+    def get_status(self) -> dict:
+        """Get status"""
+        return {
+            "mode": "openlab",
+            "broker": self.broker,
+            "topic": self.topic,
+            "connected": self.connected,
+            "control_all": self.control_all,
+            "num_lights": len(self.light_ids) if not self.control_all else 97,
+            "state": self.state.value,
+            "current_brightness": self.current_brightness,
+            "target_brightness": self.target_brightness,
+            "last_update": self.last_update,
+            "last_detection": self.last_detection_time
+        }
+    
+    def __del__(self):
+        """Cleanup"""
+        if hasattr(self, 'client'):
+            try:
+                # Turn off lights on shutdown
+                logger.info("Shutting down OpenLab lights...")
+                self.turn_off()
+                time.sleep(0.5)  # Give time for message to send
+                self.client.loop_stop()
+                self.client.disconnect()
+            except:
+                pass
+
+
 def create_light_controller(config: dict) -> LightController:
     """
     Factory function to create appropriate light controller
@@ -417,6 +563,8 @@ def create_light_controller(config: dict) -> LightController:
         return HTTPLightController(config)
     elif mode == 'hue':
         return PhilipsHueLightController(config)
+    elif mode == 'openlab':
+        return OpenLabLightController(config)
     else:
         logger.warning(f"Unknown mode '{mode}', using simulated")
         return SimulatedLightController(config)

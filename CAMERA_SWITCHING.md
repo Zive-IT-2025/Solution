@@ -15,7 +15,6 @@ camera:
   # Aktívny zdroj (default)
   source: "URL_FIRST_CAMERA"
   
-  #ss
   # Zoznam všetkých dostupných kamier
   sources:
     camera1:
