@@ -9,7 +9,15 @@ from typing import Optional, Tuple
 import logging
 import time
 import subprocess
-from streamlink import Streamlink
+
+# Optional imports
+try:
+    from streamlink import Streamlink
+    STREAMLINK_AVAILABLE = True
+except ImportError:
+    STREAMLINK_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Streamlink not available, HLS streams may not work")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -150,6 +158,10 @@ class CameraStream:
     
     def _get_streamlink_url(self, source: str) -> Optional[str]:
         """Get direct stream URL using streamlink for HLS sources"""
+        if not STREAMLINK_AVAILABLE:
+            logger.warning("Streamlink not available, cannot extract HLS stream URL")
+            return None
+            
         try:
             logger.info(f"Using streamlink to extract stream URL from: {source}")
             session = Streamlink()
@@ -195,7 +207,21 @@ class CameraStream:
                 else:
                     logger.warning("Streamlink failed, trying direct connection anyway")
             
-            self.cap = cv2.VideoCapture(source)
+            # For RTSP streams, use optimized settings
+            if isinstance(source, str) and source.startswith('rtsp://'):
+                # Use TCP for reliability and set environment variables for minimal latency
+                import os
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;1024000|max_delay;0"
+                self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            else:
+                self.cap = cv2.VideoCapture(source)
+            
+            # Reduce buffer size to minimize delay (especially for RTSP streams)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # For RTSP, also set additional low-latency parameters
+            if isinstance(source, str) and source.startswith('rtsp://'):
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
             
             # Wait a bit for connection to establish
             time.sleep(0.5)
@@ -242,6 +268,12 @@ class CameraStream:
             return False, None
         
         try:
+            # For RTSP streams, flush buffer to get latest frame
+            if isinstance(self.source, str) and self.source.startswith('rtsp://'):
+                # Grab multiple frames to clear buffer and get the most recent one
+                for _ in range(3):
+                    self.cap.grab()
+            
             ret, frame = self.cap.read()
             
             if not ret or frame is None:

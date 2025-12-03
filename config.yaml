@@ -27,7 +27,7 @@ camera:
       url: rtsp://camera.openlab.kpi.fei.tuke.sk/proxyStream-16
 detection:
   confidence: 0.5
-  frame_interval: 1
+  frame_interval: 2
   ignore_classes:
   - bird
   - cat
@@ -38,6 +38,7 @@ detection:
   target_classes:
   - person
 lighting:
+  mode: openlab  # Changed to openlab for real OpenLab lights
   auto_off_delay: 5.0
   brightness:
     false: 0
@@ -46,45 +47,52 @@ lighting:
     high: 100
   debounce_time: 0.1
   default_on_brightness: 80
+  
+  # Dynamic brightness based on detections
   dynamic_brightness:
-    class_weights:
-      bicycle: 0.4
-      bird: 0.2
-      car: 0.5
-      cat: 0.3
-      default: 0.1
-      dog: 0.3
-      motorcycle: 0.4
-      person: 1.0
-      truck: 0.5
     enabled: true
-    max_brightness: 100
     min_brightness: 10
-    score_ceiling: 0.15
+    max_brightness: 100
     score_threshold: 0.001
-  fade_duration: 0.5
+    score_ceiling: 0.15
+    class_weights:
+      person: 1.0
+      bicycle: 0.4
+      car: 0.5
+      motorcycle: 0.4
+      truck: 0.5
+      bird: 0.2
+      cat: 0.3
+      dog: 0.3
+      default: 0.1
+  
+  fade_duration: 1000  # milliseconds (epilepsy safe: minimum 250ms)
+  
+  # OpenLab MQTT Configuration (ACTIVE MODE)
+  mqtt:
+    broker: openlab.kpi.fei.tuke.sk
+    port: 1883
+    topic: openlab/lights
+    username: null
+    password: null
+  
+  # OpenLab specific settings
+  min_brightness: 20
+  max_brightness: 100
+  
+  # Legacy configs (not used in openlab mode)
   http:
     method: POST
     url: http://localhost:8000/api/lights
   hue:
     bridge_ip: 192.168.1.100
-    light_ids:
-    - 1
-    - 2
-    - 3
+    light_ids: [1, 2, 3]
     username: your-hue-username
-  mode: openlab
-  mqtt:
-    broker: localhost
-    password: null
-    port: 1883
-    topic: home/lights/control
-    username: null
   openlab:
     broker: openlab.kpi.fei.tuke.sk
+    port: 1883
     control_all: true
     light_ids: []
-    port: 1883
 logging:
   detection_log_file: detections.log
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

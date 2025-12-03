@@ -564,6 +564,8 @@ def create_light_controller(config: dict) -> LightController:
     elif mode == 'hue':
         return PhilipsHueLightController(config)
     elif mode == 'openlab':
+        logger.info("🔌 Creating OpenLab MQTT light controller for real OpenLab lights")
+        from openlab_light_controller import OpenLabLightController
         return OpenLabLightController(config)
     else:
         logger.warning(f"Unknown mode '{mode}', using simulated")
