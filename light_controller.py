@@ -50,7 +50,7 @@ class LightController(ABC):
         self.default_on_brightness = config.get('default_on_brightness', 80)
         self.fade_duration = config.get('fade_duration', 1.0)
         self.debounce_time = config.get('debounce_time', 2.0)
-        self.auto_off_delay = config.get('auto_off_delay', 10.0)
+        self.auto_off_delay = config.get('auto_off_delay', 2.0)
         
         # Dynamic brightness settings
         self.dynamic_config = config.get('dynamic_brightness', {})
@@ -201,7 +201,8 @@ class LightController(ABC):
         if self.state == LightState.ON:
             time_since_detection = current_time - self.last_detection_time
             
-            if time_since_detection > self.auto_off_delay:
+            # if time_since_detection > self.auto_off_delay:
+            if time_since_detection > 2.0:
                 logger.info(f"No detection for {time_since_detection:.1f}s, turning off")
                 self.turn_off()
 
