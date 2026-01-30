@@ -18,7 +18,8 @@ from camera import CameraStream
 from detector import ObjectDetector
 from light_controller import create_light_controller
 from video_processor import VideoProcessor
-from database import init_database, get_db
+from multi_camera_processor import MultiCameraProcessor
+from get_youtube_stream import get_youtube_stream_url
 
 # Configure logging
 logging.basicConfig(
@@ -61,7 +62,8 @@ camera: Optional[CameraStream] = None
 detector: Optional[ObjectDetector] = None
 light_controller = None
 video_processor: Optional[VideoProcessor] = None
-db = None  # Database manager
+multi_camera_processor: Optional[MultiCameraProcessor] = None
+use_multi_camera = False
 
 
 # Pydantic models for request/response
@@ -84,29 +86,27 @@ class MessageResponse(BaseModel):
     success: bool = True
 
 
+class CameraSwitchRequest(BaseModel):
+    """Model for camera switch request"""
+    camera_id: str
+
+
+class YouTubeStreamRequest(BaseModel):
+    """Model for YouTube stream URL extraction"""
+    camera_id: str
+    youtube_url: str
+
+
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     """Initialize components on startup"""
-    global camera, detector, light_controller, video_processor, db
+    global camera, detector, light_controller, video_processor, multi_camera_processor, use_multi_camera
     
     logger.info("Starting Smart Lighting Control System...")
     
     try:
-        # Initialize database
-        if config.get('database', {}).get('enabled', True):
-            db_url = config.get('database', {}).get('url', 'sqlite:///smart_lighting.db')
-            db = init_database(db_url)
-            logger.info("Database initialized")
-            
-            # Start system session
-            db.start_session(config)
-        
-        # Initialize camera
-        camera = CameraStream(config['camera'])
-        logger.info("Camera initialized")
-        
-        # Initialize detector
+        # Initialize detector (shared by all cameras)
         detector = ObjectDetector(config['detection'])
         logger.info("Object detector initialized")
         
@@ -114,15 +114,44 @@ async def startup_event():
         light_controller = create_light_controller(config['lighting'])
         logger.info("Light controller initialized")
         
-        # Initialize video processor
-        video_processor = VideoProcessor(
-            camera=camera,
-            detector=detector,
-            light_controller=light_controller,
-            config=config['detection'],
-            database=db  # Pass database to video processor
-        )
-        logger.info("Video processor initialized")
+        # Check if multi-camera mode is enabled
+        multi_camera_config = config.get('camera', {}).get('multi_camera', {})
+        use_multi_camera = multi_camera_config.get('enabled', False)
+        
+        if use_multi_camera and 'cameras' in multi_camera_config:
+            # Initialize multi-camera processor
+            logger.info("Initializing multi-camera mode...")
+            cameras = {}
+            
+            for camera_id, camera_config in multi_camera_config['cameras'].items():
+                cam_config = {
+                    'source': camera_config['url'],
+                    'fps': config['camera'].get('fps', 30),
+                    'resolution': config['camera'].get('resolution', {'width': 640, 'height': 480})
+                }
+                cameras[camera_id] = CameraStream(cam_config)
+                logger.info(f"Camera {camera_id} ({camera_config['name']}) configured")
+            
+            multi_camera_processor = MultiCameraProcessor(
+                cameras=cameras,
+                detector=detector,
+                light_controller=light_controller,
+                config=config['detection']
+            )
+            logger.info(f"Multi-camera processor initialized with {len(cameras)} cameras")
+        else:
+            # Initialize single camera mode (legacy)
+            logger.info("Initializing single camera mode...")
+            camera = CameraStream(config['camera'])
+            logger.info("Camera initialized")
+            
+            video_processor = VideoProcessor(
+                camera=camera,
+                detector=detector,
+                light_controller=light_controller,
+                config=config['detection']
+            )
+            logger.info("Video processor initialized")
         
         logger.info("System initialization complete")
     
@@ -135,18 +164,16 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    global video_processor, camera, db
+    global video_processor, multi_camera_processor, camera
     
     logger.info("Shutting down...")
     
-    if video_processor and video_processor.is_running:
-        video_processor.stop()
-    
-    # End database session
-    if db:
-        stats = video_processor.stats if video_processor else None
-        db.end_session(stats)
-        logger.info("Database session ended")
+    if use_multi_camera and multi_camera_processor:
+        if multi_camera_processor.is_running:
+            multi_camera_processor.stop()
+    elif video_processor:
+        if video_processor.is_running:
+            video_processor.stop()
     
     if camera:
         camera.disconnect()
@@ -196,101 +223,104 @@ async def api_info():
 @app.get("/status")
 async def get_status():
     """Get current system status"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    return video_processor.get_status()
+    status = processor.get_status()
+    status['multi_camera_mode'] = use_multi_camera
+    return status
 
 
 @app.post("/start")
 async def start_processing():
     """Start video processing and light control"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    if video_processor.is_running:
-        if db:
-            db.log_user_action('start', 'Attempted to start already running processor', 
-                             endpoint='/start', success=False)
+    if processor.is_running:
         return MessageResponse(
             message="Video processor already running",
             success=False
         )
     
     try:
-        video_processor.start()
-        if db:
-            db.log_user_action('start', 'Started video processing', endpoint='/start')
-        return MessageResponse(message="Video processing started")
+        processor.start()
+        mode = "multi-camera" if use_multi_camera else "single camera"
+        return MessageResponse(message=f"Video processing started ({mode} mode)")
     except Exception as e:
         logger.error(f"Error starting video processor: {e}")
-        if db:
-            db.log_user_action('start', 'Failed to start video processing', 
-                             endpoint='/start', success=False, error_message=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/stop")
 async def stop_processing():
     """Stop video processing"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    if not video_processor.is_running:
-        if db:
-            db.log_user_action('stop', 'Attempted to stop already stopped processor',
-                             endpoint='/stop', success=False)
+    if not processor.is_running:
         return MessageResponse(
             message="Video processor not running",
             success=False
         )
     
     try:
-        video_processor.stop()
-        if db:
-            db.log_user_action('stop', 'Stopped video processing', endpoint='/stop')
+        processor.stop()
         return MessageResponse(message="Video processing stopped")
     except Exception as e:
         logger.error(f"Error stopping video processor: {e}")
-        if db:
-            db.log_user_action('stop', 'Failed to stop video processing',
-                             endpoint='/stop', success=False, error_message=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+        video_processor.stop()
+        return MessageResponse(message="Video processing stopped")
+    except Exception as e:
+        logger.error(f"Error stopping video processor: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/pause")
 async def pause_processing():
     """Pause video processing"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    video_processor.pause()
+    processor.pause()
     return MessageResponse(message="Video processing paused")
 
 
 @app.post("/resume")
 async def resume_processing():
     """Resume video processing"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    video_processor.resume()
+    processor.resume()
     return MessageResponse(message="Video processing resumed")
 
 
 @app.get("/stream")
 async def video_stream():
     """Stream processed video with detections"""
-    if not video_processor:
+    processor = multi_camera_processor if use_multi_camera else video_processor
+    if not processor:
         raise HTTPException(status_code=503, detail="System not initialized")
     
-    if not video_processor.is_running:
+    if not processor.is_running:
         raise HTTPException(status_code=400, detail="Video processor not running. Start it first with POST /start")
     
     def generate_frames():
         """Generate video frames"""
-        while video_processor.is_running:
-            frame = video_processor.get_latest_frame()
+        while processor.is_running:
+            # Get frame based on mode
+            if use_multi_camera:
+                # For multi-camera, show combined view
+                frame = multi_camera_processor.get_combined_frame()
+            else:
+                frame = video_processor.get_latest_frame()
             
             if frame is not None:
                 # Encode frame as JPEG
@@ -423,6 +453,214 @@ async def reset_stats():
     return MessageResponse(message="Statistics reset")
 
 
+@app.get("/camera/list")
+async def list_cameras():
+    """List all available camera sources"""
+    if 'sources' not in config['camera']:
+        return {
+            "message": "No multiple camera sources configured",
+            "current_source": config['camera'].get('source', 'Unknown')
+        }
+    
+    sources = config['camera']['sources']
+    current_source = config['camera'].get('source', '')
+    
+    camera_list = []
+    for camera_id, camera_info in sources.items():
+        camera_list.append({
+            "id": camera_id,
+            "name": camera_info.get('name', camera_id),
+            "url": camera_info.get('url', ''),
+            "type": camera_info.get('type', 'standard'),
+            "is_active": camera_info.get('url') == current_source
+        })
+    
+    return {
+        "cameras": camera_list,
+        "total": len(camera_list)
+    }
+
+
+@app.post("/camera/switch")
+async def switch_camera(request: CameraSwitchRequest):
+    """Switch active camera in multi-camera mode or switch source in single mode"""
+    global config, camera, video_processor
+    
+    camera_id = request.camera_id
+    
+    # Multi-camera mode: just switch which camera to display
+    if use_multi_camera and multi_camera_processor:
+        if camera_id in multi_camera_processor.camera_processors:
+            multi_camera_processor.set_active_camera(camera_id)
+            return {
+                "message": f"Switched to camera: {camera_id}",
+                "camera_id": camera_id,
+                "mode": "multi-camera"
+            }
+        else:
+            available = list(multi_camera_processor.camera_processors.keys())
+            raise HTTPException(
+                status_code=404,
+                detail=f"Camera '{camera_id}' not found. Available: {available}"
+            )
+    
+    # Single camera mode: switch camera source (legacy behavior)
+    if 'sources' not in config['camera']:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple camera sources not configured in config.yaml"
+        )
+    
+    # Validate camera ID
+    if camera_id not in config['camera']['sources']:
+        available = list(config['camera']['sources'].keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_id}' not found. Available: {available}"
+        )
+    
+    # Get camera configuration
+    camera_source_config = config['camera']['sources'][camera_id]
+    camera_name = camera_source_config.get('name', camera_id)
+    
+    try:
+        # Stop video processing if running
+        was_running = False
+        if video_processor and video_processor.is_running:
+            was_running = True
+            video_processor.stop()
+            logger.info("Stopped video processor for camera switch")
+        
+        # Disconnect old camera
+        if camera:
+            camera.disconnect()
+            logger.info("Disconnected old camera")
+        
+        # Update config with the selected camera's full configuration
+        new_camera_config = config['camera'].copy()
+        
+        # Merge camera source config into main camera config
+        for key, value in camera_source_config.items():
+            if key != 'name':  # Don't override config keys with 'name'
+                new_camera_config[key] = value
+        
+        # Keep FPS and resolution from main config if not specified
+        new_camera_config['fps'] = config['camera'].get('fps', 30)
+        new_camera_config['resolution'] = config['camera'].get('resolution', {'width': 640, 'height': 480})
+        
+        # Initialize new camera with merged config
+        camera = CameraStream(new_camera_config)
+        if not camera.connect():
+            raise Exception("Failed to connect to new camera source")
+        
+        logger.info(f"Connected to new camera: {camera_name}")
+        
+        # Update main config
+        config['camera']['source'] = camera_source_config.get('url', camera_source_config)
+        
+        # Update video processor with new camera
+        if video_processor:
+            video_processor.camera = camera
+        
+        # Restart video processing if it was running
+        if was_running and video_processor:
+            video_processor.start()
+            logger.info("Restarted video processor with new camera")
+        
+        return {
+            "message": f"Successfully switched to camera: {camera_name}",
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "camera_type": camera_source_config.get('type', 'standard'),
+            "processing_resumed": was_running,
+            "mode": "single-camera"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error switching camera: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to switch camera: {str(e)}")
+
+
+@app.post("/camera/set-stream")
+async def set_custom_stream(request: YouTubeStreamRequest):
+    """
+    Extract stream URL from YouTube or set custom RTSP/stream URL for specified camera
+    
+    Args:
+        camera_id: ID of camera to update (e.g., 'camera1', 'camera2', 'real_camera')
+        youtube_url: YouTube video/livestream URL or RTSP URL (e.g., rtsp://camera.openlab...)
+    
+    Returns:
+        Success message with extracted stream URL
+    """
+    global config, camera, video_processor
+    
+    # Check if multiple sources are configured
+    if 'sources' not in config['camera']:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple camera sources not configured in config.yaml"
+        )
+    
+    # Validate camera ID
+    camera_id = request.camera_id
+    if camera_id not in config['camera']['sources']:
+        available = list(config['camera']['sources'].keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_id}' not found. Available: {available}"
+        )
+    
+    try:
+        # Check if it's an RTSP URL or YouTube URL
+        input_url = request.youtube_url.strip()
+        
+        if input_url.startswith('rtsp://') or (input_url.startswith('http') and 'youtube' not in input_url.lower()):
+            # Direct stream URL (RTSP, HTTP, etc.)
+            stream_url = input_url
+            logger.info(f"Using direct stream URL: {stream_url}")
+        else:
+            # YouTube URL - extract stream
+            logger.info(f"Extracting stream URL from YouTube: {request.youtube_url}")
+            stream_url = get_youtube_stream_url(request.youtube_url)
+            
+            if not stream_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Failed to extract stream URL from YouTube. Please check the URL."
+                )
+        
+        # Update config in memory
+        config['camera']['sources'][camera_id]['url'] = stream_url
+        
+        # Save to config.yaml file
+        config_path = Path("config.yaml")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+        
+        logger.info(f"Updated {camera_id} with new stream URL")
+        
+        stream_type = "RTSP" if stream_url.startswith('rtsp://') else "Stream"
+        return {
+            "message": f"Successfully updated {camera_id} with {stream_type}",
+            "camera_id": camera_id,
+            "camera_name": config['camera']['sources'][camera_id].get('name', camera_id),
+            "input_url": request.youtube_url,
+            "stream_url": stream_url[:100] + "..." if len(stream_url) > 100 else stream_url,
+            "stream_type": stream_type,
+            "note": "Use 'Camera Source' dropdown to switch to this camera"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting YouTube stream: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract YouTube stream: {str(e)}"
+        )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -445,176 +683,6 @@ async def health_check():
         health_status["status"] = "degraded"
     
     return health_status
-
-
-# Database API Endpoints
-
-@app.get("/db/stats")
-async def get_database_stats():
-    """Get comprehensive database statistics"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        return db.get_dashboard_stats()
-    except Exception as e:
-        logger.error(f"Error getting database stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/db/detections")
-async def get_detections(limit: int = 100, triggered_only: bool = False):
-    """Get recent detection events"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        detections = db.get_recent_detections(limit=limit, triggered_only=triggered_only)
-        return {
-            "count": len(detections),
-            "detections": detections
-        }
-    except Exception as e:
-        logger.error(f"Error getting detections: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/db/detections/stats")
-async def get_detection_statistics(hours: int = 24):
-    """Get detection statistics for the last N hours"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        return db.get_detection_stats(hours=hours)
-    except Exception as e:
-        logger.error(f"Error getting detection stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/db/lights")
-async def get_light_events(limit: int = 100):
-    """Get recent light control events"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        events = db.get_recent_light_events(limit=limit)
-        return {
-            "count": len(events),
-            "events": events
-        }
-    except Exception as e:
-        logger.error(f"Error getting light events: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/db/sessions")
-async def get_session_history(limit: int = 50):
-    """Get system session history"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        sessions = db.get_session_history(limit=limit)
-        return {
-            "count": len(sessions),
-            "sessions": sessions
-        }
-    except Exception as e:
-        logger.error(f"Error getting sessions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/db/user-actions")
-async def get_user_action_history(limit: int = 100):
-    """Get user action history"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        actions = db.get_user_actions(limit=limit)
-        return {
-            "count": len(actions),
-            "actions": actions
-        }
-    except Exception as e:
-        logger.error(f"Error getting user actions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/db/cleanup")
-async def cleanup_old_data(days_to_keep: int = 30):
-    """Manually trigger database cleanup"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        db.cleanup_old_data(days_to_keep=days_to_keep)
-        return MessageResponse(message=f"Cleaned up data older than {days_to_keep} days")
-    except Exception as e:
-        logger.error(f"Error cleaning up data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Sensor Data Endpoints (for future IoT integration)
-
-@app.post("/sensors/reading")
-async def log_sensor_data(sensor_id: str, sensor_type: str, value: float,
-                         unit: Optional[str] = None, location: Optional[str] = None):
-    """Log a sensor reading (for future IoT device integration)"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        reading_id = db.log_sensor_reading(
-            sensor_id=sensor_id,
-            sensor_type=sensor_type,
-            value=value,
-            unit=unit,
-            location=location
-        )
-        return {"reading_id": reading_id, "message": "Sensor reading logged"}
-    except Exception as e:
-        logger.error(f"Error logging sensor reading: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/sensors/readings")
-async def get_sensor_readings(sensor_type: Optional[str] = None, 
-                             sensor_id: Optional[str] = None,
-                             limit: int = 100):
-    """Get sensor readings with optional filtering"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        readings = db.get_sensor_readings(
-            sensor_type=sensor_type,
-            sensor_id=sensor_id,
-            limit=limit
-        )
-        return {
-            "count": len(readings),
-            "readings": readings
-        }
-    except Exception as e:
-        logger.error(f"Error getting sensor readings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/sensors/stats/{sensor_type}")
-async def get_sensor_statistics(sensor_type: str, hours: int = 24):
-    """Get statistics for a specific sensor type"""
-    if not db:
-        raise HTTPException(status_code=503, detail="Database not enabled")
-    
-    try:
-        stats = db.get_sensor_stats(sensor_type=sensor_type, hours=hours)
-        return stats
-    except Exception as e:
-        logger.error(f"Error getting sensor stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Main entry point

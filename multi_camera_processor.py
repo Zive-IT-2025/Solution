@@ -258,7 +258,7 @@ class MultiCameraProcessor:
         logger.info("Light control loop started")
         last_light_state = False
         last_person_seen_time = None
-        lights_off_delay = 30.0  # 30 seconds delay before turning off lights
+        lights_off_delay = 2.0  # 2 seconds delay before turning off lights
         
         while self.is_running:
             if self.is_paused:
@@ -301,10 +301,10 @@ class MultiCameraProcessor:
                 last_light_state = True
                 
             elif not should_turn_on and last_light_state:
-                # Turn off lights (after 30 second delay)
+                # Turn off lights (after delay)
                 self.light_controller.turn_off()
-                logger.info("Lights turned OFF (no people detected for 30 seconds)")
-                self._log_detection("Lights OFF - no people detected for 30 seconds")
+                logger.info(f"Lights turned OFF (no people detected for {lights_off_delay} seconds)")
+                self._log_detection(f"Lights OFF - no people detected for {lights_off_delay} seconds")
                 last_light_state = False
             
             time.sleep(0.1)  # Check 10 times per second
